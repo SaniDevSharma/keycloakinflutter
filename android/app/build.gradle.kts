@@ -28,10 +28,6 @@ android {
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName
-
-        // Required by flutter_appauth: must match the scheme in your redirect URI.
-        // Redirect URI: com.example.mobileappwithkeycloak://oauthredirect
-        manifestPlaceholders["appAuthRedirectScheme"] = "com.example.mobileappwithkeycloak"
     }
 
     buildTypes {

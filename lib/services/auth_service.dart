@@ -1,9 +1,12 @@
 import 'dart:convert';
+import 'dart:math';
 
-import 'package:flutter_appauth/flutter_appauth.dart';
+import 'package:crypto/crypto.dart';
+import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 
 import '../config/keycloak_config.dart';
+import '../screens/login_webview_screen.dart';
 import 'dpop_service.dart';
 import 'secure_storage_service.dart';
 
@@ -38,7 +41,7 @@ class UserInfo {
 }
 
 /// Service that manages the full Keycloak OAuth2 / OIDC lifecycle:
-///  • Authorization Code + PKCE via flutter_appauth (browser)
+///  • Authorization Code + PKCE via in-app webview
 ///  • Manual token exchange with DPoP proof header
 ///  • Token refresh with fresh DPoP proof
 ///  • Logout / session end
@@ -50,8 +53,6 @@ class AuthService {
   static const _accessTokenKey = 'access_token';
   static const _refreshTokenKey = 'refresh_token';
   static const _idTokenKey = 'id_token';
-
-  final _appAuth = const FlutterAppAuth();
 
   // ──────────────────────────────────────────
   // Public API
@@ -67,39 +68,50 @@ class AuthService {
   Future<String?> get storedAccessToken =>
       SecureStorageService.instance.read(_accessTokenKey);
 
-  /// Performs the full Authorization Code + PKCE + DPoP login.
-  ///
-  /// Strategy: Use [authorizeAndExchangeCode] so AppAuth handles both the
-  /// browser redirect AND the initial token exchange (without DPoP first to
-  /// get auth code + tokens). If the server enforces DPoP, we fall back to
-  /// the two-step [authorize] → manual token exchange with the DPoP header.
-  Future<UserInfo> login() async {
-    return _loginWithDpop();
-  }
+  /// Performs the full Authorization Code + PKCE + DPoP login using in-app Webview.
+  Future<UserInfo> login(BuildContext context) async {
+    // Generate PKCE values manually
+    final codeVerifier = _generateCodeVerifier();
+    final codeChallenge = _generateCodeChallenge(codeVerifier);
+    final state = _generateState();
 
-  /// Two-step flow:
-  ///  1. [authorize] — opens browser, gets auth code + PKCE verifier.
-  ///  2. Manual POST to /token with DPoP header.
-  Future<UserInfo> _loginWithDpop() async {
-    // Step 1 – browser auth (PKCE automatically handled by AppAuth).
-    final authResponse = await _appAuth.authorize(
-      AuthorizationRequest(
-        KeycloakConfig.clientId,
-        KeycloakConfig.redirectUri,
-        serviceConfiguration: AuthorizationServiceConfiguration(
-          authorizationEndpoint: KeycloakConfig.authorizationEndpoint,
-          tokenEndpoint: KeycloakConfig.tokenEndpoint,
-          endSessionEndpoint: KeycloakConfig.endSessionEndpoint,
+    // Construct authorization URL
+    final authUrl = Uri.parse(KeycloakConfig.authorizationEndpoint).replace(
+      queryParameters: {
+        'response_type': 'code',
+        'client_id': KeycloakConfig.clientId,
+        'redirect_uri': KeycloakConfig.redirectUri,
+        'scope': KeycloakConfig.scopes.join(' '),
+        'state': state,
+        'code_challenge': codeChallenge,
+        'code_challenge_method': 'S256',
+      },
+    ).toString();
+
+    // Launch webview and wait for result
+    final result = await Navigator.of(context).push<Map<String, String?>>(
+      MaterialPageRoute(
+        builder: (context) => LoginWebviewScreen(
+          authUrl: authUrl,
+          redirectUri: KeycloakConfig.redirectUri,
         ),
-        scopes: KeycloakConfig.scopes,
       ),
     );
 
-    if (authResponse.authorizationCode == null) {
-      throw Exception('Authorization cancelled or no code received.');
+    if (result == null) {
+      throw Exception('User cancelled flow');
     }
 
-    // Step 2 – manual token exchange with DPoP proof.
+    if (result['error'] != null) {
+      throw Exception(result['error_description'] ?? result['error']);
+    }
+
+    final code = result['code'];
+    if (code == null) {
+      throw Exception('No authorization code returned from login.');
+    }
+
+    // Step 2 – manual token exchange with DPoP proof
     final dpopProof = DpopService.instance.buildDpopProof(
       'POST',
       KeycloakConfig.tokenEndpoint,
@@ -114,15 +126,15 @@ class AuthService {
       body: {
         'grant_type': 'authorization_code',
         'client_id': KeycloakConfig.clientId,
-        'code': authResponse.authorizationCode!,
+        'code': code,
         'redirect_uri': KeycloakConfig.redirectUri,
-        'code_verifier': authResponse.codeVerifier ?? '',
+        'code_verifier': codeVerifier,
       },
     );
 
     if (response.statusCode != 200) {
       final body = response.body;
-      // Handle Keycloak's DPoP nonce challenge (use_dpop_nonce).
+      // Handle Keycloak's DPoP nonce challenge (use_dpop_nonce)
       if (response.statusCode == 400) {
         final json = jsonDecode(body) as Map<String, dynamic>;
         final error = json['error'] as String? ?? '';
@@ -130,8 +142,8 @@ class AuthService {
           final nonce = response.headers['dpop-nonce'];
           if (nonce != null) {
             return _retryTokenExchangeWithNonce(
-              authCode: authResponse.authorizationCode!,
-              codeVerifier: authResponse.codeVerifier ?? '',
+              authCode: code,
+              codeVerifier: codeVerifier,
               nonce: nonce,
             );
           }
@@ -146,7 +158,6 @@ class AuthService {
   }
 
   /// Retries the token exchange including a Keycloak-provided DPoP nonce.
-  /// Keycloak may require a server-issued nonce on the first request.
   Future<UserInfo> _retryTokenExchangeWithNonce({
     required String authCode,
     required String codeVerifier,
@@ -224,20 +235,17 @@ class AuthService {
   Future<void> logout() async {
     final idToken = await SecureStorageService.instance.read(_idTokenKey);
 
-    try {
-      await _appAuth.endSession(
-        EndSessionRequest(
-          idTokenHint: idToken,
-          postLogoutRedirectUrl: KeycloakConfig.redirectUri,
-          serviceConfiguration: AuthorizationServiceConfiguration(
-            authorizationEndpoint: KeycloakConfig.authorizationEndpoint,
-            tokenEndpoint: KeycloakConfig.tokenEndpoint,
-            endSessionEndpoint: KeycloakConfig.endSessionEndpoint,
-          ),
-        ),
-      );
-    } catch (_) {
-      // If the logout browser flow fails, still clear local tokens.
+    if (idToken != null) {
+      try {
+        final logoutUrl = Uri.parse(KeycloakConfig.endSessionEndpoint).replace(
+          queryParameters: {
+            'id_token_hint': idToken,
+            'post_logout_redirect_uri': KeycloakConfig.redirectUri,
+          },
+        );
+        // Best effort background GET to notify server
+        await http.get(logoutUrl).timeout(const Duration(seconds: 3));
+      } catch (_) {}
     }
 
     await SecureStorageService.instance.delete(_accessTokenKey);
@@ -248,6 +256,27 @@ class AuthService {
   // ──────────────────────────────────────────
   // Private helpers
   // ──────────────────────────────────────────
+
+  /// Generates a cryptographically secure PKCE code verifier (RFC 7636).
+  String _generateCodeVerifier() {
+    final random = Random.secure();
+    final values = List<int>.generate(32, (_) => random.nextInt(256));
+    return base64Url.encode(values).replaceAll('=', '');
+  }
+
+  /// Generates a PKCE code challenge S256 (RFC 7636).
+  String _generateCodeChallenge(String verifier) {
+    final bytes = utf8.encode(verifier);
+    final digest = sha256.convert(bytes);
+    return base64Url.encode(digest.bytes).replaceAll('=', '');
+  }
+
+  /// Generates a random state string.
+  String _generateState() {
+    final random = Random.secure();
+    final values = List<int>.generate(16, (_) => random.nextInt(256));
+    return base64Url.encode(values).replaceAll('=', '');
+  }
 
   Future<void> _storeTokens(Map<String, dynamic> tokenData) async {
     final store = SecureStorageService.instance;

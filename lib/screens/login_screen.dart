@@ -59,7 +59,7 @@ class _LoginScreenState extends State<LoginScreen>
 
     try {
       await DpopService.instance.init();
-      final userInfo = await AuthService.instance.login();
+      final userInfo = await AuthService.instance.login(context);
 
       if (!mounted) return;
       Navigator.of(context).pushReplacement(
